@@ -15,7 +15,7 @@ from rl_games.interfaces.base_algorithm import  BaseAlgorithm
 import numpy as np
 import time
 import gym
-
+from collections import OrderedDict
 from datetime import datetime
 from tensorboardX import SummaryWriter
 import torch 
@@ -728,6 +728,16 @@ class A2CBase(BaseAlgorithm):
             if obs_batch.dtype == torch.uint8:
                 obs_batch = obs_batch.float() / 255.0
         return obs_batch
+
+    def _preproc_obs_finetune(self, obs_batch):
+        N = int(obs_batch.size(0) / self.vec_env.env.num_envs)
+        obs_dict = OrderedDict()
+        obs = OrderedDict()
+        obs["current_angles"] = obs_batch[:, 7:14]
+        obs["goal_angles"] = self.vec_env.env.goal_config.clone().repeat(N, 1)
+        obs["compute_pcd_params"] = self.vec_env.env.compute_combined_pcds().repeat(N, 1, 1)
+        obs_dict['obs'] = obs
+        return obs_dict
 
     def play_steps(self):
         update_list = self.update_list

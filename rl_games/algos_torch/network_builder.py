@@ -557,61 +557,34 @@ class A2CRobomimicBuilder(NetworkBuilder):
             self.num_seqs = num_seqs = kwargs.pop('num_seqs', 1)
 
             NetworkBuilder.BaseNetwork.__init__(self)
+            # first hard code to get things working, modify and clean up later
+            # initialize policy
+            torch.backends.cudnn.benchmark = True
+            torch.set_float32_matmul_precision("medium")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch._dynamo.config.suppress_errors = True
+            import robomimic.utils.file_utils as FileUtils
+            import robomimic.utils.torch_utils as TorchUtils
+
+            mdl_path = "../robomimic/mp_models/models_2_12/model_epoch_1600.pth"
+            device = TorchUtils.get_torch_device(try_to_use_cuda=True)
+            policy, ckpt_dict = FileUtils.policy_from_checkpoint(
+                ckpt_path=mdl_path, device=device, verbose=True
+            )
+
+            self.actor = policy
+            self.critic_encoder = self.actor.policy.nets['policy'].model.nets['encoder']
+            self.critic_decoder = nn.Sequential()
+            encoder_output_size = self.critic_encoder.output_shape()[0]
+
             self.load(params)
-            self.actor_cnn = nn.Sequential()
-            self.critic_cnn = nn.Sequential()
-            self.actor_mlp = nn.Sequential()
-            self.critic_mlp = nn.Sequential()
-            
-            if self.has_cnn:
-                if self.permute_input:
-                    input_shape = torch_ext.shape_whc_to_cwh(input_shape)
-                cnn_args = {
-                    'ctype' : self.cnn['type'], 
-                    'input_shape' : input_shape, 
-                    'convs' :self.cnn['convs'], 
-                    'activation' : self.cnn['activation'], 
-                    'norm_func_name' : self.normalization,
-                }
-                self.actor_cnn = self._build_conv(**cnn_args)
 
-                if self.separate:
-                    self.critic_cnn = self._build_conv( **cnn_args)
-
-            cnn_output_size = self._calc_input_size(input_shape, self.actor_cnn)
-
-            mlp_input_size = cnn_output_size
+            mlp_input_size = encoder_output_size
             if len(self.units) == 0:
-                out_size = cnn_output_size
+                out_size = encoder_output_size
             else:
                 out_size = self.units[-1]
-
-            if self.has_rnn:
-                if not self.is_rnn_before_mlp:
-                    rnn_in_size = out_size
-                    if self.rnn_concat_input:
-                        rnn_in_size += cnn_output_size
-
-                    out_size = self.rnn_units
-                    if self.rnn_concat_output:
-                        out_size += cnn_output_size
-                else:
-                    rnn_in_size = cnn_output_size
-
-                    mlp_input_size = self.rnn_units
-                    if self.rnn_concat_output:
-                        mlp_input_size += cnn_output_size
-
-                if self.separate:
-                    self.a_rnn = self._build_rnn(self.rnn_name, rnn_in_size, self.rnn_units, self.rnn_layers)
-                    self.c_rnn = self._build_rnn(self.rnn_name, rnn_in_size, self.rnn_units, self.rnn_layers)
-                    if self.rnn_ln:
-                        self.a_layer_norm = torch.nn.LayerNorm(self.rnn_units)
-                        self.c_layer_norm = torch.nn.LayerNorm(self.rnn_units)
-                else:
-                    self.rnn = self._build_rnn(self.rnn_name, rnn_in_size, self.rnn_units, self.rnn_layers)
-                    if self.rnn_ln:
-                        self.layer_norm = torch.nn.LayerNorm(self.rnn_units)
 
             mlp_args = {
                 'input_size' : mlp_input_size,
@@ -622,20 +595,11 @@ class A2CRobomimicBuilder(NetworkBuilder):
                 'd2rl' : self.is_d2rl,
                 'norm_only_first_layer' : self.norm_only_first_layer
             }
-            self.actor_mlp = self._build_mlp(**mlp_args)
-            if self.separate:
-                self.critic_mlp = self._build_mlp(**mlp_args)
+            self.critic_decoder = self._build_mlp(**mlp_args)
 
             self.value = self._build_value_layer(out_size, self.value_size)
             self.value_act = self.activations_factory.create(self.value_activation)
 
-            if self.is_discrete:
-                self.logits = torch.nn.Linear(out_size, actions_num)
-            '''
-                for multidiscrete actions num is a tuple
-            '''
-            if self.is_multi_discrete:
-                self.logits = torch.nn.ModuleList([torch.nn.Linear(out_size, num) for num in actions_num])
             if self.is_continuous:
                 self.mu = torch.nn.Linear(out_size, actions_num)
                 self.mu_act = self.activations_factory.create(self.space_config['mu_activation']) 
@@ -649,14 +613,8 @@ class A2CRobomimicBuilder(NetworkBuilder):
                     self.sigma = torch.nn.Linear(out_size, actions_num)
 
             mlp_init = self.init_factory.create(**self.initializer)
-            if self.has_cnn:
-                cnn_init = self.init_factory.create(**self.cnn['initializer'])
 
-            for m in self.modules():         
-                if isinstance(m, nn.Conv2d) or isinstance(m, nn.Conv1d):
-                    cnn_init(m.weight)
-                    if getattr(m, "bias", None) is not None:
-                        torch.nn.init.zeros_(m.bias)
+            for m in self.critic_decoder.modules():
                 if isinstance(m, nn.Linear):
                     mlp_init(m.weight)
                     if getattr(m, "bias", None) is not None:
@@ -675,154 +633,75 @@ class A2CRobomimicBuilder(NetworkBuilder):
             dones = obs_dict.get('dones', None)
             bptt_len = obs_dict.get('bptt_len', 0)
 
-            if self.has_cnn:
-                # for obs shape 4
-                # input expected shape (B, W, H, C)
-                # convert to (B, C, W, H)
-                if self.permute_input and len(obs.shape) == 4:
-                    obs = obs.permute((0, 3, 1, 2))
+            a_out = self.actor(obs['obs']) # Rollout policy will output np.ndarray, should be tensor...
+            feats = self.critic_encoder(**obs)
+            c_out = self.critic_decoder(feats)
+            value = self.value_act(self.value(c_out))
+            a_out = torch.Tensor(a_out).to(c_out.device)
 
-            if self.separate:
-                a_out = c_out = obs
-                a_out = self.actor_cnn(a_out)
-                a_out = a_out.contiguous().view(a_out.size(0), -1)
+            if self.is_continuous:
+                # mu = self.mu_act(self.mu(a_out))
 
-                c_out = self.critic_cnn(c_out)
-                c_out = c_out.contiguous().view(c_out.size(0), -1)                    
-
-                if self.has_rnn:
-                    seq_length = obs_dict.get('seq_length', 1)
-
-                    a_cnn_out = a_out
-                    c_cnn_out = c_out
-                    if not self.is_rnn_before_mlp:
-                        a_out = self.actor_mlp(a_cnn_out)
-                        c_out = self.critic_mlp(c_cnn_out)
-
-                        if self.rnn_concat_input:
-                            a_out = torch.cat([a_out, a_cnn_out], dim=1)
-                            c_out = torch.cat([c_out, c_cnn_out], dim=1)
-
-                    batch_size = a_out.size()[0]
-                    num_seqs = batch_size // seq_length
-                    a_out = a_out.reshape(num_seqs, seq_length, -1)
-                    c_out = c_out.reshape(num_seqs, seq_length, -1)
-
-                    a_out = a_out.transpose(0,1)
-                    c_out = c_out.transpose(0,1)
-                    if dones is not None:
-                        dones = dones.reshape(num_seqs, seq_length, -1)
-                        dones = dones.transpose(0,1)
-
-                    if len(states) == 2:
-                        a_states = states[0]
-                        c_states = states[1]
-                    else:
-                        a_states = states[:2]
-                        c_states = states[2:]                        
-                    a_out, a_states = self.a_rnn(a_out, a_states, dones, bptt_len)
-                    c_out, c_states = self.c_rnn(c_out, c_states, dones, bptt_len)
-
-                    a_out = a_out.transpose(0,1)
-                    c_out = c_out.transpose(0,1)
-                    a_out = a_out.contiguous().reshape(a_out.size()[0] * a_out.size()[1], -1)
-                    c_out = c_out.contiguous().reshape(c_out.size()[0] * c_out.size()[1], -1)
-
-                    if self.rnn_ln:
-                        a_out = self.a_layer_norm(a_out)
-                        c_out = self.c_layer_norm(c_out)
-
-                    if type(a_states) is not tuple:
-                        a_states = (a_states,)
-                        c_states = (c_states,)
-                    states = a_states + c_states
-
-                    if self.rnn_concat_output:
-                        a_out = torch.cat([a_out, a_cnn_out], dim=1)
-                        c_out = torch.cat([c_out, c_cnn_out], dim=1)
-
-                    if self.is_rnn_before_mlp:
-                        a_out = self.actor_mlp(a_out)
-                        c_out = self.critic_mlp(c_out)
+                if self.fixed_sigma:
+                    sigma = self.sigma_act(self.sigma)
                 else:
-                    a_out = self.actor_mlp(a_out)
-                    c_out = self.critic_mlp(c_out)
+                    sigma = self.sigma_act(self.sigma(a_out))
+
+                return a_out, sigma, value, states
+
+            # if self.separate:
+            #     a_out = c_out = obs
+            #     a_out = self.actor_cnn(a_out)
+            #     a_out = a_out.contiguous().view(a_out.size(0), -1)
+
+            #     c_out = self.critic_cnn(c_out)
+            #     c_out = c_out.contiguous().view(c_out.size(0), -1)                    
+
+            #     a_out = self.actor_mlp(a_out)
+            #     c_out = self.critic_mlp(c_out)
                             
-                value = self.value_act(self.value(c_out))
+            #     value = self.value_act(self.value(c_out))
 
-                if self.is_discrete:
-                    logits = self.logits(a_out)
-                    return logits, value, states
+            #     if self.is_discrete:
+            #         logits = self.logits(a_out)
+            #         return logits, value, states
 
-                if self.is_multi_discrete:
-                    logits = [logit(a_out) for logit in self.logits]
-                    return logits, value, states
+            #     if self.is_multi_discrete:
+            #         logits = [logit(a_out) for logit in self.logits]
+            #         return logits, value, states
 
-                if self.is_continuous:
-                    mu = self.mu_act(self.mu(a_out))
-                    if self.fixed_sigma:
-                        sigma = mu * 0.0 + self.sigma_act(self.sigma)
-                    else:
-                        sigma = self.sigma_act(self.sigma(a_out))
+            #     if self.is_continuous:
+            #         mu = self.mu_act(self.mu(a_out))
+            #         if self.fixed_sigma:
+            #             sigma = mu * 0.0 + self.sigma_act(self.sigma)
+            #         else:
+            #             sigma = self.sigma_act(self.sigma(a_out))
 
-                    return mu, sigma, value, states
-            else:
-                out = obs
-                out = self.actor_cnn(out)
-                out = out.flatten(1)                
+            #         return mu, sigma, value, states
+            # else:
+            #     out = obs
+            #     out = self.actor_cnn(out)
+            #     out = out.flatten(1)                
 
-                if self.has_rnn:
-                    seq_length = obs_dict.get('seq_length', 1)
+            #     out = self.actor_mlp(out)
+            #     value = self.value_act(self.value(out))
 
-                    cnn_out = out
-                    if not self.is_rnn_before_mlp:
-                        out = self.actor_mlp(out)
-                        if self.rnn_concat_input:
-                            out = torch.cat([out, cnn_out], dim=1)
+            #     if self.central_value:
+            #         return value, states
 
-                    batch_size = out.size()[0]
-                    num_seqs = batch_size // seq_length
-                    out = out.reshape(num_seqs, seq_length, -1)
-
-                    if len(states) == 1:
-                        states = states[0]
-
-                    out = out.transpose(0, 1)
-                    if dones is not None:
-                        dones = dones.reshape(num_seqs, seq_length, -1)
-                        dones = dones.transpose(0, 1)
-                    out, states = self.rnn(out, states, dones, bptt_len)
-                    out = out.transpose(0, 1)
-                    out = out.contiguous().reshape(out.size()[0] * out.size()[1], -1)
-
-                    if self.rnn_ln:
-                        out = self.layer_norm(out)
-                    if self.rnn_concat_output:
-                        out = torch.cat([out, cnn_out], dim=1)
-                    if self.is_rnn_before_mlp:
-                        out = self.actor_mlp(out)
-                    if type(states) is not tuple:
-                        states = (states,)
-                else:
-                    out = self.actor_mlp(out)
-                value = self.value_act(self.value(out))
-
-                if self.central_value:
-                    return value, states
-
-                if self.is_discrete:
-                    logits = self.logits(out)
-                    return logits, value, states
-                if self.is_multi_discrete:
-                    logits = [logit(out) for logit in self.logits]
-                    return logits, value, states
-                if self.is_continuous:
-                    mu = self.mu_act(self.mu(out))
-                    if self.fixed_sigma:
-                        sigma = self.sigma_act(self.sigma)
-                    else:
-                        sigma = self.sigma_act(self.sigma(out))
-                    return mu, mu*0 + sigma, value, states
+            #     if self.is_discrete:
+            #         logits = self.logits(out)
+            #         return logits, value, states
+            #     if self.is_multi_discrete:
+            #         logits = [logit(out) for logit in self.logits]
+            #         return logits, value, states
+            #     if self.is_continuous:
+            #         mu = self.mu_act(self.mu(out))
+            #         if self.fixed_sigma:
+            #             sigma = self.sigma_act(self.sigma)
+            #         else:
+            #             sigma = self.sigma_act(self.sigma(out))
+            #         return mu, mu*0 + sigma, value, states
                     
         def is_separate_critic(self):
             return self.separate
