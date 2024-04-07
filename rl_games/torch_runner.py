@@ -50,6 +50,7 @@ class Runner:
         """
 
         self.algo_factory = object_factory.ObjectFactory()
+        self.algo_factory.register_builder('a2c_ft', lambda **kwargs : a2c_continuous.A2CFTAgent(**kwargs))
         self.algo_factory.register_builder('a2c_continuous', lambda **kwargs : a2c_continuous.A2CAgent(**kwargs))
         self.algo_factory.register_builder('a2c_discrete', lambda **kwargs : a2c_discrete.DiscreteA2CAgent(**kwargs)) 
         self.algo_factory.register_builder('sac', lambda **kwargs: sac_agent.SACAgent(**kwargs))

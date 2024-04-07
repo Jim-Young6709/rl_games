@@ -7,7 +7,8 @@ from rl_games.common import datasets
 
 from torch import optim
 import torch 
-
+import time
+from collections import OrderedDict
 
 class A2CAgent(a2c_common.ContinuousA2CBase):
     """Continuous PPO Agent
@@ -219,6 +220,7 @@ class A2CFTAgent(a2c_common.ContinuousA2CBase):
         build_config = {
             'actions_num' : self.actions_num,
             'input_shape' : obs_shape,
+            'seq_length' : self.seq_length,
             'num_seqs' : self.num_actors * self.num_agents,
             'value_size': self.env_info.get('value_size',1),
             'normalize_value' : self.normalize_value,
@@ -260,6 +262,102 @@ class A2CFTAgent(a2c_common.ContinuousA2CBase):
 
         self.has_value_loss = self.use_experimental_cv or not self.has_central_value
         self.algo_observer.after_init(self)
+
+    def _preproc_obs(self, obs_batch):
+        N = int(obs_batch.size(0) / self.vec_env.env.num_envs)
+        obs = OrderedDict()
+        obs["current_angles"] = obs_batch[:, 7:14]
+        obs["goal_angles"] = self.vec_env.env.goal_config.clone().repeat(N, 1)
+        obs["compute_pcd_params"] = self.vec_env.env.compute_combined_pcds().repeat(N, 1, 1)
+        return obs
+
+    def play_steps_rnn(self):
+        update_list = self.update_list
+        mb_rnn_states = self.mb_rnn_states
+        step_time = 0.0
+
+        for n in range(self.horizon_length):
+            if n % self.seq_length == 0:
+                for s, mb_s in zip(self.rnn_states, mb_rnn_states):
+                    mb_s[n // self.seq_length,:,:,:] = s
+
+            if self.has_central_value:
+                self.central_value_net.pre_step_rnn(n)
+
+            if self.use_action_masks:
+                masks = self.vec_env.get_action_masks()
+                res_dict = self.get_masked_action_values(self.obs, masks)
+            else:
+                res_dict = self.get_action_values(self.obs)
+            self.rnn_states = res_dict['rnn_states']
+            self.experience_buffer.update_data('obses', n, self.obs['obs'])
+            self.experience_buffer.update_data('dones', n, self.dones.byte())
+
+            for k in update_list:
+                self.experience_buffer.update_data(k, n, res_dict[k])
+            if self.has_central_value:
+                self.experience_buffer.update_data('states', n, self.obs['states'])
+
+            step_time_start = time.time()
+            self.obs, rewards, self.dones, infos = self.env_step(res_dict['actions'])
+            step_time_end = time.time()
+
+            step_time += (step_time_end - step_time_start)
+
+            shaped_rewards = self.rewards_shaper(rewards)
+
+            if self.value_bootstrap and 'time_outs' in infos:
+                shaped_rewards += self.gamma * res_dict['values'] * self.cast_obs(infos['time_outs']).unsqueeze(1).float()
+
+            self.experience_buffer.update_data('rewards', n, shaped_rewards)
+
+            self.current_rewards += rewards
+            self.current_shaped_rewards += shaped_rewards
+            self.current_lengths += 1
+            all_done_indices = self.dones.nonzero(as_tuple=False)
+            env_done_indices = all_done_indices[::self.num_agents]
+
+            if len(all_done_indices) > 0:
+                if self.zero_rnn_on_done:
+                    for s in self.rnn_states:
+                        s[:, all_done_indices, :] = s[:, all_done_indices, :] * 0.0
+                if self.has_central_value:
+                    self.central_value_net.post_step_rnn(all_done_indices)
+
+            self.game_rewards.update(self.current_rewards[env_done_indices])
+            self.game_shaped_rewards.update(self.current_shaped_rewards[env_done_indices])
+            self.game_lengths.update(self.current_lengths[env_done_indices])
+            self.algo_observer.process_infos(infos, env_done_indices)
+
+            not_dones = 1.0 - self.dones.float()
+
+            self.current_rewards = self.current_rewards * not_dones.unsqueeze(1)
+            self.current_shaped_rewards = self.current_shaped_rewards * not_dones.unsqueeze(1)
+            self.current_lengths = self.current_lengths * not_dones
+
+        last_values = self.get_values(self.obs)
+
+        fdones = self.dones.float()
+        mb_fdones = self.experience_buffer.tensor_dict['dones'].float()
+
+        mb_values = self.experience_buffer.tensor_dict['values']
+        mb_rewards = self.experience_buffer.tensor_dict['rewards']
+        mb_advs = self.discount_values(fdones, last_values, mb_fdones, mb_values, mb_rewards)
+        mb_returns = mb_advs + mb_values
+        batch_dict = self.experience_buffer.get_transformed_list(swap_and_flatten01, self.tensor_list)
+
+        batch_dict['returns'] = swap_and_flatten01(mb_returns)
+        batch_dict['played_frames'] = self.batch_size
+        states = []
+        for mb_s in mb_rnn_states:
+            t_size = mb_s.size()[0] * mb_s.size()[2]
+            h_size = mb_s.size()[3]
+            states.append(mb_s.permute(1,2,0,3).reshape(-1,t_size, h_size))
+
+        batch_dict['rnn_states'] = states
+        batch_dict['step_time'] = step_time
+
+        return batch_dict
 
     def update_epoch(self):
         self.epoch_num += 1
@@ -312,9 +410,7 @@ class A2CFTAgent(a2c_common.ContinuousA2CBase):
 
             if self.zero_rnn_on_done:
                 batch_dict['dones'] = input_dict['dones']            
-        # import ipdb ; ipdb.set_trace()
-        # batch_dict['obs']['obs']['compute_pcd_params'].shape = [minibatch_size, 8192, 4]
-        # batch_dict['obs']['obs']['current_angles'].shape = [minibatch_size, 7]
+
         with torch.cuda.amp.autocast(enabled=self.mixed_precision):
             res_dict = self.model(batch_dict)
             action_log_probs = res_dict['prev_neglogp']
@@ -390,4 +486,12 @@ class A2CFTAgent(a2c_common.ContinuousA2CBase):
             b_loss = 0
         return b_loss
 
+def swap_and_flatten01(arr):
+    """
+    swap and then flatten axes 0 and 1
+    """
+    if arr is None:
+        return arr
+    s = arr.size()
+    return arr.transpose(0, 1).reshape(s[0] * s[1], *s[2:])
 

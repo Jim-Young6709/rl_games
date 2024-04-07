@@ -9,6 +9,8 @@ from rl_games.algos_torch.sac_helper import  SquashedNormal
 from rl_games.common.layers.recurrent import  GRUWithDones, LSTMWithDones
 from rl_games.common.layers.value import  TwoHotEncodedValue, DefaultValue
 
+import robomimic.utils.tensor_utils as TensorUtils
+
 
 def _create_initializer(func, **kwargs):
     return lambda v : func(v, **kwargs)
@@ -568,15 +570,18 @@ class A2CRobomimicBuilder(NetworkBuilder):
             import robomimic.utils.torch_utils as TorchUtils
 
             mdl_path = "../robomimic/mp_models/models_2_12/model_epoch_1600.pth"
-            device = TorchUtils.get_torch_device(try_to_use_cuda=True)
+            self.device = TorchUtils.get_torch_device(try_to_use_cuda=True)
             policy, ckpt_dict = FileUtils.policy_from_checkpoint(
-                ckpt_path=mdl_path, device=device, verbose=True
+                ckpt_path=mdl_path, device=self.device, verbose=True
             )
 
-            self.actor = policy
-            self.critic_encoder = self.actor.policy.nets['policy'].model.nets['encoder']
+            self._rnn_hidden_state = None
+            self._rnn_horizon = kwargs.pop('seq_length', 1)
+            self._rnn_counter = 0
+
+            self.actor = policy.policy.nets['policy']
             self.critic_decoder = nn.Sequential()
-            encoder_output_size = self.critic_encoder.output_shape()[0]
+            encoder_output_size = self.actor.model.nets['encoder'].output_shape()[0]
 
             self.load(params)
 
@@ -632,12 +637,26 @@ class A2CRobomimicBuilder(NetworkBuilder):
             states = obs_dict.get('rnn_states', None)
             dones = obs_dict.get('dones', None)
             bptt_len = obs_dict.get('bptt_len', 0)
+            is_train = obs_dict.get('is_train', False)
+            goal_dict = obs_dict.get('goal_dict', None)
 
-            a_out = self.actor(obs['obs']) # Rollout policy will output np.ndarray, should be tensor...
-            feats = self.critic_encoder(**obs)
+            if is_train:
+                assert self.training == True
+                obs = TensorUtils.to_sequence(obs)
+                a_dists, self._rnn_hidden_state = self.actor('train', obs, goal_dict=goal_dict, rnn_init_state=states, return_state=True)
+                a_out = a_dists.sample()
+                a_out = a_out.contiguous().view(a_out.size()[0] * a_out.size()[1], -1)
+            else:
+                assert self.training == False
+                if self._rnn_hidden_state is None or self._rnn_counter % self._rnn_horizon == 0:
+                    self._rnn_hidden_state = self.get_default_rnn_state()
+                self._rnn_counter += 1
+                a_out, self._rnn_hidden_state = self.actor('step', obs, goal_dict=goal_dict, rnn_state=self._rnn_hidden_state)
+
+            feats = self.actor.model.encoded_feats
+            feats = feats.contiguous().view(feats.size(0), -1)
             c_out = self.critic_decoder(feats)
             value = self.value_act(self.value(c_out))
-            a_out = torch.Tensor(a_out).to(c_out.device)
 
             if self.is_continuous:
                 # mu = self.mu_act(self.mu(a_out))
@@ -646,62 +665,8 @@ class A2CRobomimicBuilder(NetworkBuilder):
                     sigma = self.sigma_act(self.sigma)
                 else:
                     sigma = self.sigma_act(self.sigma(a_out))
-
+                states = self._rnn_hidden_state
                 return a_out, sigma, value, states
-
-            # if self.separate:
-            #     a_out = c_out = obs
-            #     a_out = self.actor_cnn(a_out)
-            #     a_out = a_out.contiguous().view(a_out.size(0), -1)
-
-            #     c_out = self.critic_cnn(c_out)
-            #     c_out = c_out.contiguous().view(c_out.size(0), -1)                    
-
-            #     a_out = self.actor_mlp(a_out)
-            #     c_out = self.critic_mlp(c_out)
-                            
-            #     value = self.value_act(self.value(c_out))
-
-            #     if self.is_discrete:
-            #         logits = self.logits(a_out)
-            #         return logits, value, states
-
-            #     if self.is_multi_discrete:
-            #         logits = [logit(a_out) for logit in self.logits]
-            #         return logits, value, states
-
-            #     if self.is_continuous:
-            #         mu = self.mu_act(self.mu(a_out))
-            #         if self.fixed_sigma:
-            #             sigma = mu * 0.0 + self.sigma_act(self.sigma)
-            #         else:
-            #             sigma = self.sigma_act(self.sigma(a_out))
-
-            #         return mu, sigma, value, states
-            # else:
-            #     out = obs
-            #     out = self.actor_cnn(out)
-            #     out = out.flatten(1)                
-
-            #     out = self.actor_mlp(out)
-            #     value = self.value_act(self.value(out))
-
-            #     if self.central_value:
-            #         return value, states
-
-            #     if self.is_discrete:
-            #         logits = self.logits(out)
-            #         return logits, value, states
-            #     if self.is_multi_discrete:
-            #         logits = [logit(out) for logit in self.logits]
-            #         return logits, value, states
-            #     if self.is_continuous:
-            #         mu = self.mu_act(self.mu(out))
-            #         if self.fixed_sigma:
-            #             sigma = self.sigma_act(self.sigma)
-            #         else:
-            #             sigma = self.sigma_act(self.sigma(out))
-            #         return mu, mu*0 + sigma, value, states
                     
         def is_separate_critic(self):
             return self.separate
@@ -709,29 +674,14 @@ class A2CRobomimicBuilder(NetworkBuilder):
         def is_rnn(self):
             return self.has_rnn
 
-        def get_default_rnn_state(self):
-            if not self.has_rnn:
-                return None
-            num_layers = self.rnn_layers
-            if self.rnn_name == 'identity':
-                rnn_units = 1
-            else:
-                rnn_units = self.rnn_units
-            if self.rnn_name == 'lstm':
-                if self.separate:
-                    return (torch.zeros((num_layers, self.num_seqs, rnn_units)), 
-                            torch.zeros((num_layers, self.num_seqs, rnn_units)),
-                            torch.zeros((num_layers, self.num_seqs, rnn_units)), 
-                            torch.zeros((num_layers, self.num_seqs, rnn_units)))
-                else:
-                    return (torch.zeros((num_layers, self.num_seqs, rnn_units)), 
-                            torch.zeros((num_layers, self.num_seqs, rnn_units)))
-            else:
-                if self.separate:
-                    return (torch.zeros((num_layers, self.num_seqs, rnn_units)), 
-                            torch.zeros((num_layers, self.num_seqs, rnn_units)))
-                else:
-                    return (torch.zeros((num_layers, self.num_seqs, rnn_units)),)                
+        def get_default_rnn_state(self, batch_size=None):
+            if batch_size is None:
+                batch_size = self.num_seqs
+            return self.actor('get_rnn_init_state', batch_size=batch_size, device=self.device)               
+
+        def reset_rnn_state(self):
+            self._rnn_hidden_state = None
+            self._rnn_counter = 0
 
         def load(self, params):
             self.separate = params.get('separate', False)

@@ -314,6 +314,9 @@ class ModelA2CContinuousLogStdRobomimic(BaseModel):
         def get_default_rnn_state(self):
             return self.a2c_network.get_default_rnn_state()
 
+        def reset_rnn_state(self):
+            self.a2c_network.reset_rnn_state()
+
         def forward(self, input_dict):
             is_train = input_dict.get('is_train', True)
             prev_actions = input_dict.get('prev_actions', None)
