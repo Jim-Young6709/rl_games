@@ -164,6 +164,7 @@ class A2CBase(BaseAlgorithm):
         # TODO: do we still need it?
         self.ppo = config.get('ppo', True)
         self.max_epochs = self.config.get('max_epochs', -1)
+        self.warmup_epochs = self.config.get('warmup_epochs', 0)
         self.max_frames = self.config.get('max_frames', -1)
 
         self.is_adaptive_lr = config['lr_schedule'] == 'adaptive'
@@ -379,6 +380,13 @@ class A2CBase(BaseAlgorithm):
 
     def set_train(self):
         self.model.train()
+        if self.epoch_num < self.warmup_epochs:
+            self.model.a2c_network.actor.eval()
+            for param in self.model.a2c_network.actor.parameters():
+                param.requires_grad = False
+        else:
+            for param in self.model.a2c_network.actor.parameters():
+                param.requires_grad = True
         if self.normalize_rms_advantage:
             self.advantage_mean_std.train()
 
